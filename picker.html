@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Pick your Tiller sheet</title>
+<!--
+  $avAIer Google Picker page (S45). Hosted as a STATIC file on any static host
+  (GitHub Pages / Cloudflare Pages / your domain). Loaded by the app inside iOS's
+  SYSTEM BROWSER (ASWebAuthenticationSession), which shares Safari's Google session —
+  so the Picker can browse (unlike a WKWebView, which iOS isolates from the session).
+
+  PRIVACY: no user data ever reaches the hosting server. The OAuth token arrives in
+  the URL #fragment (fragments are NEVER sent in the HTTP request), is used only by
+  the in-page Google Picker JS, and the picked file-ID is handed back to the app via
+  a savaier:// redirect. The server only ever serves this one static file.
+-->
+<style>
+  html,body{margin:0;height:100%;font-family:-apple-system,system-ui,sans-serif;background:#fff;color:#5f6368}
+  #m{display:flex;align-items:center;justify-content:center;height:100%;font-size:15px;text-align:center;padding:0 24px}
+</style>
+</head>
+<body>
+<div id="m">Loading your Google Sheets…</div>
+<script>
+  function readParams(){
+    var p={}, h=(location.hash||'').replace(/^#/,'');
+    h.split('&').forEach(function(kv){ var i=kv.indexOf('='); if(i>0){ p[decodeURIComponent(kv.slice(0,i))]=decodeURIComponent(kv.slice(i+1)); } });
+    return p;
+  }
+  var P=readParams();
+  var TOKEN=P.token||'', KEY=P.key||'', QUERY=P.q||'Tiller', REDIRECT=P.redirect||'savaier://tiller-picked';
+  function go(qs){ try{ location.href=REDIRECT+'?'+qs; }catch(e){} }
+  function fail(m){ try{ document.getElementById('m').textContent='Couldn’t open the picker. Go back and try again.'; }catch(e){} go('error='+encodeURIComponent(m||'load failed')); }
+  window.onerror=function(m){ fail(m); };
+  if(!TOKEN||!KEY){ fail('missing token or key'); }
+  function loadPicker(){ try{ gapi.load('picker',{callback:onPickerLoad,onerror:function(){fail('picker api load failed');}}); }catch(e){ fail(e&&e.message); } }
+  function onPickerLoad(){
+    try{
+      var view=new google.picker.DocsView(google.picker.ViewId.SPREADSHEETS)
+        .setMode(google.picker.DocsViewMode.LIST)
+        .setOwnedByMe(true)
+        .setIncludeFolders(false);
+      if(QUERY){ try{ view.setQuery(QUERY); }catch(e){} }
+      var picker=new google.picker.PickerBuilder()
+        .addView(view)
+        .setOAuthToken(TOKEN)
+        .setDeveloperKey(KEY)
+        .enableFeature(google.picker.Feature.NAV_HIDDEN)
+        .setCallback(function(data){
+          var a=data[google.picker.Response.ACTION];
+          if(a===google.picker.Action.PICKED){
+            var d=data[google.picker.Response.DOCUMENTS][0];
+            go('fileId='+encodeURIComponent(d[google.picker.Document.ID])+'&name='+encodeURIComponent(d[google.picker.Document.NAME]||''));
+          }else if(a===google.picker.Action.CANCEL){
+            go('cancelled=1');
+          }
+        })
+        .build();
+      picker.setVisible(true);
+    }catch(e){ fail(e&&e.message); }
+  }
+  var s=document.createElement('script'); s.src='https://apis.google.com/js/api.js';
+  s.onload=loadPicker; s.onerror=function(){ fail('gapi script failed'); };
+  document.head.appendChild(s);
+</script>
+</body>
+</html>
