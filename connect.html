@@ -109,6 +109,9 @@
     // code→token exchange. Google's Web client REQUIRES a secret at the token endpoint (even with
     // PKCE), and a static page can't hold one — so the exchange happens on the broker, not here.
     BROKER_BASE_URL: 'https://rjjoedkfsikkysrwvtws.supabase.co/functions/v1/tiller-broker',
+    // Cloud PROJECT NUMBER (the numeric prefix of the client id). REQUIRED for the Picker to
+    // actually grant drive.file access to this app — without it the pick records no grant (404s).
+    APP_ID: '918304572303',
     // drive.file = NARROWEST scope: access ONLY to files the user explicitly picks.
     SCOPES: 'https://www.googleapis.com/auth/drive.file',
   };
@@ -231,6 +234,7 @@
       try { view.setQuery('Tiller'); } catch (e) {}
       var picker = new google.picker.PickerBuilder()
         .addView(view)
+        .setAppId(CONFIG.APP_ID)               // REQUIRED so the pick grants drive.file to THIS app
         .setOAuthToken(STATE.accessToken)
         .setDeveloperKey(CONFIG.API_KEY)
         .enableFeature(google.picker.Feature.NAV_HIDDEN)
