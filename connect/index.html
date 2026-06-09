@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect $avAIer to your Tiller sheet</title>
+<!--
+  $avAIer DESKTOP CONNECT PAGE (S45 — the QR-handoff, the LOCKED main onboarding).
+
+  Runs on a COMPUTER (any desktop browser — the Google Picker works here; it's dead on
+  iOS because of Safari's ITP cookie wall). Flow:
+    1. PKCE OAuth on the WEB client (NO client secret, access_type=offline → refresh token).
+    2. Google Picker with the NARROW `drive.file` scope → the user picks ONE Tiller sheet.
+    3. We now hold `{ refreshToken, sheetId }` and render it as a QR code.
+    4. The phone's in-app camera scans the QR → stores the token + id in the Keychain and
+       reads that ONE sheet live via the Sheets API. New banks land in the same sheet.
+
+  ZERO-FOOTPRINT / PRIVACY: this is a STATIC file. Nothing is sent to the hosting server —
+  the OAuth code arrives in the URL query (handled in-page), tokens are exchanged directly
+  with Google from the browser (PKCE, no secret), and the refresh token only ever appears
+  inside this page and in the QR the user's own phone scans. The page stores nothing.
+
+  ── DEVELOPER SETUP (Hemant, one-time) ───────────────────────────────────────────────
+  1. Google Cloud Console → APIs & Services → Credentials → Create credentials →
+     OAuth client ID → Application type: **Web application**.
+       • Authorized JavaScript origins: the origin this page is hosted on
+         (e.g. https://savaier.github.io)
+       • Authorized redirect URIs: the FULL url of THIS page
+         (e.g. https://savaier.github.io/connect/connect.html)
+     Paste the client id into CONFIG.WEB_CLIENT_ID below AND lib/config.js
+     GOOGLE_WEB_OAUTH_CLIENT_ID (they must match).
+  2. Reuse (or create) a project API key (Credentials → Create credentials → API key),
+     restricted by HTTP referrer to this page's origin, with the Picker API + Google
+     Sheets API enabled. Paste it into CONFIG.API_KEY below.
+  3. Host this single file (GitHub Pages / Cloudflare Pages / your domain) at the exact
+     redirect URI from step 1, and set lib/config.js GOOGLE_CONNECT_PAGE_URL to it.
+-->
+<style>
+  :root { color-scheme: light; }
+  html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:#0b0f14;color:#e8eef2}
+  .wrap{max-width:560px;margin:0 auto;padding:48px 24px;text-align:center}
+  h1{font-size:26px;margin:0 0 6px;color:#fff;letter-spacing:-.3px}
+  .teal{color:#14B8A6}
+  p{color:#9aa6b2;font-size:15px;line-height:1.55;margin:10px 0}
+  .card{background:#121821;border:1px solid #1f2a36;border-radius:16px;padding:24px;margin-top:24px}
+  button{appearance:none;border:0;background:#14B8A6;color:#04201c;font-size:15px;font-weight:700;border-radius:12px;padding:13px 22px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .step{display:inline-block;font-size:11px;font-weight:700;letter-spacing:1.1px;color:#14B8A6;margin-bottom:10px}
+  #qr{display:inline-block;background:#fff;padding:16px;border-radius:14px;margin:6px 0 4px}
+  #qr svg, #qr img, #qr canvas{display:block;width:280px;height:280px}
+  .muted{color:#6b7785;font-size:12px;line-height:1.5;margin-top:14px}
+  .err{color:#f87171}
+  .hide{display:none}
+  a{color:#14B8A6}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Connect <span class="teal">$avAIer</span></h1>
+  <p>Link your Tiller sheet with <b>single-file access</b> — $avAIer can only ever read the
+     one sheet you pick, nothing else in your Drive. Do this once on your computer; your
+     phone then syncs forever, new banks included.</p>
+
+  <div id="cardSignIn" class="card hide">
+    <span class="step">STEP 1 — SIGN IN</span>
+    <p>Sign in with Google and approve read access to a single file you choose next.</p>
+    <button id="btnSignIn">Sign in with Google</button>
+  </div>
+
+  <div id="cardPick" class="card hide">
+    <span class="step">STEP 2 — PICK YOUR TILLER SHEET</span>
+    <p>Choose the spreadsheet Tiller created for you.</p>
+    <button id="btnPick">Choose my Tiller sheet</button>
+  </div>
+
+  <div id="cardQR" class="card hide">
+    <span class="step">STEP 3 — SCAN WITH YOUR PHONE</span>
+    <p>In $avAIer, tap <b>Connect from your computer</b> → <b>Scan QR</b>, then point your
+       camera here.</p>
+    <div id="qr"></div>
+    <p class="muted">This code carries a private key into your phone only. Don't share a
+       screenshot of it. It expires if not scanned soon.</p>
+    <button id="btnRestart">Start over</button>
+  </div>
+
+  <div id="cardBusy" class="card">
+    <p id="busyMsg">Loading…</p>
+  </div>
+
+  <div id="cardErr" class="card hide">
+    <p class="err" id="errMsg">Something went wrong.</p>
+    <button id="btnRetry">Try again</button>
+  </div>
+
+  <p class="muted">Nothing on this page is sent to any server. Your sign-in happens directly
+     with Google; the connection key only ever lives in this page and the phone that scans it.</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ── CONFIG — Hemant fills these (see the setup comment in <head>) ──────────────
+  var CONFIG = {
+    WEB_CLIENT_ID: '918304572303-m42h0ovgqu48updsnnpe34oni9eetb3i.apps.googleusercontent.com',
+    API_KEY: 'AIzaSyCzAWcZtxRsr-SwE-MxAiix__4E3Mhw7v8',
+    // The token broker (Supabase Edge Function) that holds the OAuth client secret and does the
+    // code→token exchange. Google's Web client REQUIRES a secret at the token endpoint (even with
+    // PKCE), and a static page can't hold one — so the exchange happens on the broker, not here.
+    BROKER_BASE_URL: 'https://rjjoedkfsikkysrwvtws.supabase.co/functions/v1/tiller-broker',
+    // Cloud PROJECT NUMBER (the numeric prefix of the client id). REQUIRED for the Picker to
+    // actually grant drive.file access to this app — without it the pick records no grant (404s).
+    APP_ID: '918304572303',
+    // drive.file = NARROWEST scope: access ONLY to files the user explicitly picks.
+    SCOPES: 'https://www.googleapis.com/auth/drive.file',
+  };
+  var REDIRECT_URI = location.origin + location.pathname;   // must match the Web client's redirect URI
+  var AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
+  var PKCE_KEY = 'savaier_pkce_v', STATE_KEY = 'savaier_pkce_s';
+
+  var els = {
+    signIn: document.getElementById('cardSignIn'),
+    pick: document.getElementById('cardPick'),
+    qr: document.getElementById('cardQR'),
+    busy: document.getElementById('cardBusy'),
+    busyMsg: document.getElementById('busyMsg'),
+    err: document.getElementById('cardErr'),
+    errMsg: document.getElementById('errMsg'),
+    qrBox: document.getElementById('qr'),
+  };
+  function show(which, msg) {
+    ['signIn','pick','qr','busy','err'].forEach(function (k) { els[k].classList.add('hide'); });
+    if (which === 'busy' && msg) els.busyMsg.textContent = msg;
+    if (which === 'err') els.errMsg.textContent = msg || 'Something went wrong.';
+    els[which].classList.remove('hide');
+  }
+  function configured() {
+    return !/PASTE_/.test(CONFIG.WEB_CLIENT_ID)
+      && !/PASTE_/.test(CONFIG.API_KEY)
+      && !/PASTE_/.test(CONFIG.BROKER_BASE_URL);
+  }
+
+  // ── PKCE helpers (Web Crypto — no secret anywhere) ─────────────────────────────
+  function b64url(buf) {
+    var bytes = new Uint8Array(buf), s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function randomString(len) {
+    var arr = new Uint8Array(len); crypto.getRandomValues(arr);
+    var charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~', out = '';
+    for (var i = 0; i < len; i++) out += charset[arr[i] % charset.length];
+    return out;
+  }
+  async function challengeFromVerifier(verifier) {
+    var digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    return b64url(digest);
+  }
+
+  // ── Step 1: kick off PKCE sign-in (redirects to Google) ────────────────────────
+  async function startSignIn() {
+    try {
+      show('busy', 'Opening Google sign-in…');
+      var verifier = randomString(64), state = randomString(24);
+      sessionStorage.setItem(PKCE_KEY, verifier);
+      sessionStorage.setItem(STATE_KEY, state);
+      var challenge = await challengeFromVerifier(verifier);
+      var qs = [
+        'client_id=' + encodeURIComponent(CONFIG.WEB_CLIENT_ID),
+        'redirect_uri=' + encodeURIComponent(REDIRECT_URI),
+        'response_type=code',
+        'scope=' + encodeURIComponent(CONFIG.SCOPES),
+        'code_challenge=' + challenge,
+        'code_challenge_method=S256',
+        'state=' + state,
+        'access_type=offline',     // ← refresh token
+        'prompt=consent',          // ← force a refresh token even on re-consent
+        'include_granted_scopes=true'
+      ].join('&');
+      location.href = AUTH_ENDPOINT + '?' + qs;
+    } catch (e) { show('err', humanize(e)); }
+  }
+
+  // ── Step 1b: handle the redirect back (?code=…) → exchange for tokens ───────────
+  async function handleRedirect(code, state) {
+    var savedState = sessionStorage.getItem(STATE_KEY);
+    var verifier = sessionStorage.getItem(PKCE_KEY);
+    // Clean the code out of the URL bar immediately (don't leave it in history).
+    history.replaceState({}, document.title, REDIRECT_URI);
+    if (!verifier || !savedState || state !== savedState) {
+      show('err', 'Sign-in could not be verified. Please start over.'); return;
+    }
+    try {
+      show('busy', 'Finishing sign-in…');
+      // The broker holds the OAuth client secret and exchanges the code with Google. We send only the
+      // code + PKCE verifier + redirect_uri; the broker returns the access + refresh tokens. The
+      // secret never touches this page. (The broker stores nothing — it relays the tokens back.)
+      var res = await fetch(CONFIG.BROKER_BASE_URL.replace(/\/+$/, '') + '/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: code, code_verifier: verifier, redirect_uri: REDIRECT_URI })
+      });
+      if (!res.ok) throw new Error('Sign-in failed (HTTP ' + res.status + ').');
+      var data = await res.json();
+      sessionStorage.removeItem(PKCE_KEY); sessionStorage.removeItem(STATE_KEY);
+      if (!data.refreshToken) {
+        throw new Error('Google didn’t return a refresh token. Revoke $avAIer at myaccount.google.com/permissions, then start over.');
+      }
+      STATE.accessToken = data.accessToken;
+      STATE.refreshToken = data.refreshToken;
+      show('pick');
+    } catch (e) { show('err', humanize(e)); }
+  }
+
+  // ── Step 2: Google Picker (drive.file) → fileId ────────────────────────────────
+  function loadPickerApi() {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = 'https://apis.google.com/js/api.js';
+      s.onload = function () { gapi.load('picker', { callback: resolve, onerror: function () { reject(new Error('Picker failed to load.')); } }); };
+      s.onerror = function () { reject(new Error('Couldn’t reach Google.')); };
+      document.head.appendChild(s);
+    });
+  }
+  async function openPicker() {
+    try {
+      show('busy', 'Opening your Google Sheets…');
+      if (!STATE.pickerReady) { await loadPickerApi(); STATE.pickerReady = true; }
+      var view = new google.picker.DocsView(google.picker.ViewId.SPREADSHEETS)
+        .setMode(google.picker.DocsViewMode.LIST)
+        .setOwnedByMe(true)
+        .setIncludeFolders(false);
+      try { view.setQuery('Tiller'); } catch (e) {}
+      var picker = new google.picker.PickerBuilder()
+        .addView(view)
+        .setAppId(CONFIG.APP_ID)               // REQUIRED so the pick grants drive.file to THIS app
+        .setOAuthToken(STATE.accessToken)
+        .setDeveloperKey(CONFIG.API_KEY)
+        .enableFeature(google.picker.Feature.NAV_HIDDEN)
+        .setCallback(function (d) {
+          var action = d[google.picker.Response.ACTION];
+          if (action === google.picker.Action.PICKED) {
+            var doc = d[google.picker.Response.DOCUMENTS][0];
+            renderQR(doc[google.picker.Document.ID]);
+          } else if (action === google.picker.Action.CANCEL) {
+            show('pick');
+          }
+        })
+        .build();
+      picker.setVisible(true);
+    } catch (e) { show('err', humanize(e)); }
+  }
+
+  // ── Step 3: render the QR of { refreshToken, sheetId } ─────────────────────────
+  function renderQR(sheetId) {
+    try {
+      var payload = JSON.stringify({ refreshToken: STATE.refreshToken, sheetId: sheetId });
+      var qr = qrcode(0, 'M');            // type 0 = auto-size; M = ~15% error correction
+      qr.addData(payload);
+      qr.make();
+      els.qrBox.innerHTML = qr.createSvgTag({ cellSize: 6, margin: 0, scalable: true });
+      var svg = els.qrBox.querySelector('svg');
+      if (svg) { svg.setAttribute('width', '280'); svg.setAttribute('height', '280'); }
+      show('qr');
+    } catch (e) { show('err', humanize(e)); }
+  }
+
+  function humanize(e) { return (e && e.message) ? e.message : 'Something went wrong. Please start over.'; }
+
+  // ── Boot ───────────────────────────────────────────────────────────────────────
+  var STATE = { accessToken: null, refreshToken: null, pickerReady: false };
+  document.getElementById('btnSignIn').addEventListener('click', startSignIn);
+  document.getElementById('btnPick').addEventListener('click', openPicker);
+  document.getElementById('btnRestart').addEventListener('click', function () { location.href = REDIRECT_URI; });
+  document.getElementById('btnRetry').addEventListener('click', function () { location.href = REDIRECT_URI; });
+
+  function boot() {
+    if (!configured()) { show('err', 'This connect page isn’t configured yet (missing OAuth client id / API key).'); return; }
+    var params = new URLSearchParams(location.search);
+    if (params.get('error')) { show('err', 'Google sign-in was cancelled or denied.'); return; }
+    var code = params.get('code');
+    if (code) { handleRedirect(code, params.get('state')); return; }
+    show('signIn');
+  }
+  boot();
+})();
+</script>
+</body>
+</html>
